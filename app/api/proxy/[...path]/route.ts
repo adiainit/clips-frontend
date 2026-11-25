@@ -3,6 +3,8 @@ import { cookies } from 'next/headers';
 import { createHash } from 'crypto';
 import { logApiRequest, shouldLogBody } from '@/lib/apiLogger';
 import { rejectDisallowedOrigin } from '@/lib/cors';
+import { apiError } from '@/lib/apiResponse';
+import { REQUEST_ID_HEADER, resolveRequestId } from '@/lib/requestId';
 
 // Disable Next.js body parsing — we stream the raw body directly to the backend.
 // Without this, Next.js buffers and size-limits request bodies (bad for uploads/SSE).
@@ -33,15 +35,34 @@ async function computeEtag(
 }
 
 async function handler(req: NextRequest) {
+  // Issue #1391 — correlate this request end-to-end (middleware → proxy →
+  // backend → response) with a single request ID.
+  const requestId = resolveRequestId(req.headers);
+
   // Issue #1370 — reject credentialed requests from non-allowlisted origins.
-  const corsBlock = rejectDisallowedOrigin(req);
+  const corsBlock = rejectDisallowedOrigin(req, requestId);
   if (corsBlock) return corsBlock;
 
   const startedAt = Date.now();
   const baseUrl = (process.env.API_URL || 'https://clipcash-api.onrender.com').replace(/\/+$/, '');
 
   const path = req.nextUrl.pathname.replace(/^\/api\/proxy/, '');
-  const search = req.nextUrl.search;
+  let search = req.nextUrl.search;
+
+  // Issue #1248 — list endpoints share one pagination contract: validate the
+  // opaque cursor (400 on garbage) and apply the default / max `limit`.
+  if (req.method === 'GET' && isPaginatedListPath(path)) {
+    try {
+      const normalized = normalizeListSearchParams(req.nextUrl.searchParams).toString();
+      search = normalized ? `?${normalized}` : '';
+    } catch (err) {
+      if (err instanceof InvalidCursorError) {
+        return NextResponse.json(invalidCursorBody(err), { status: 400 });
+      }
+      throw err;
+    }
+  }
+
   const targetUrl = `${baseUrl}${path}${search}`;
   let bodyText: string | null = null;
 
@@ -52,6 +73,8 @@ async function handler(req: NextRequest) {
   headers.delete('accept-encoding');
   // Remove content-length to let fetch/undici calculate it correctly
   headers.delete('content-length');
+  // Forward the request ID so backend logs share the same correlation ID.
+  headers.set(REQUEST_ID_HEADER, requestId);
 
   // Explicitly forward all cookies from the browser to the backend
   const cookieStore = await cookies();
@@ -126,17 +149,12 @@ async function handler(req: NextRequest) {
       durationMs: Date.now() - startedAt,
     });
 
-    return new NextResponse(
-      JSON.stringify({
-        statusCode: 503,
-        message: isWakeUp
-          ? 'Server is starting up — please wait a moment and try again.'
-          : 'Could not reach the server.',
-      }),
-      {
-        status: 503,
-        headers: { 'content-type': 'application/json' },
-      }
+    return apiError(
+      503,
+      isWakeUp
+        ? 'Server is starting up — please wait a moment and try again.'
+        : 'Could not reach the server.',
+      { code: isWakeUp ? 'BACKEND_STARTING' : 'BACKEND_UNREACHABLE', requestId, cause: err }
     );
   }
 
@@ -153,6 +171,7 @@ async function handler(req: NextRequest) {
   // Remove encoding headers — no longer valid after Node's auto-decompression
   responseHeaders.delete('content-encoding');
   responseHeaders.delete('content-length');
+  responseHeaders.set(REQUEST_ID_HEADER, requestId);
 
   // Fix Set-Cookie headers forwarded from the backend
   const setCookies = responseHeaders.getSetCookie();
@@ -215,6 +234,7 @@ async function handler(req: NextRequest) {
       headers: {
         etag,
         'cache-control': responseHeaders.get('cache-control') || 'no-cache',
+        [REQUEST_ID_HEADER]: requestId,
       },
     });
   }
